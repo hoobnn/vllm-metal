@@ -4,6 +4,7 @@
 import importlib
 import os
 import platform
+import re
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -412,6 +413,22 @@ class TestMetalPlatform:
         )
         with pytest.raises(NotImplementedError, match="single process"):
             MetalPlatform.check_and_update_config(vllm_config)
+
+    def test_check_and_update_config_rejects_explicit_v2_model_runner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicit V2 request fails with the Metal constraint, not Triton's."""
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+
+        with pytest.raises(
+            NotImplementedError,
+            match=re.escape(
+                "VLLM_USE_V2_MODEL_RUNNER=1 is not supported on Metal: MetalWorker "
+                "implements the V1 model runner contract. Unset it (vllm-metal "
+                "defaults it to 0)."
+            ),
+        ):
+            MetalPlatform.check_and_update_config(self._platform_config())
 
     def test_check_and_update_config_rejects_tensor_parallel(self) -> None:
         """Tensor parallelism is unsupported on Metal yet; reject it at config time."""
@@ -1905,24 +1922,16 @@ class TestKvBudgetBytes:
 
 
 class TestAutoFitMaxModelLenChain:
-    """The -1 sentinel drives the Metal null-block auto-fit contract.
+    """The -1 sentinel drives the null-block auto-fit contract on Metal shapes.
 
     Builds the gemma-4-31B mixed-MHA KV shape and runs vLLM's
-    ``get_kv_cache_configs`` against fixed synthetic memory budgets. These
-    tests do not re-test upstream's fitting algorithm; they check Metal's
-    null-block reservation, too-small-pool failure, and current mixed-layout
-    budget shape for issue #505.
+    ``get_kv_cache_configs`` against fixed synthetic memory budgets: the
+    fitted length leaves the null block free, a too-small pool fails, and
+    the mixed layout keeps its budget shape (issue #505).
     """
 
     _NUM_LAYERS = 60
     _MAX_BATCH_TOKENS = 2048
-
-    @pytest.fixture(autouse=True)
-    def _ensure_compat_patches(self) -> None:
-        """The null-block auto-fit patch (compat.py) is part of the contract
-        under test; ensure it directly because plugin activation can skip it
-        while vLLM is partially imported."""
-        compat.ensure_vllm_auto_fit_null_block_patch()
 
     # 16 tokens x (50 x 16 x 256 + 10 x 4 x 512) heads*dims x K/V x bf16 —
     # equals the packed per-block bytes the Metal pool reports.
@@ -1979,11 +1988,13 @@ class TestAutoFitMaxModelLenChain:
         assert len(full_groups) == 1
         assert sum(len(group.layer_names) for group in sliding_groups) == 50
         assert sum(len(group.layer_names) for group in full_groups) == 10
-        assert len(config.kv_cache_tensors) == 10
+        # One tensor per cache group, all describing the same backing allocation.
+        assert len(config.kv_cache_tensors) == 6
+        assert len({tensor.size for tensor in config.kv_cache_tensors}) == 1
         capacity, _ = get_kv_cache_capacity(vllm_config, config)
         assert vllm_config.model_config.max_model_len == self._DERIVED_MAX_LEN
         assert capacity >= self._DERIVED_MAX_LEN
-        assert sum(tensor.size for tensor in config.kv_cache_tensors) <= available
+        assert config.kv_cache_tensors[0].size <= available
 
     def test_insufficient_memory_for_one_block_raises(self) -> None:
         available = self._PACKED_BLOCK_BYTES - 1

@@ -386,6 +386,17 @@ class MetalPlatform(Platform):
         # Retry after vLLM is fully imported, before serving tokenizers are built.
         ensure_vllm_bytelevel_tokenizer_patch()
 
+        import vllm.envs as vllm_envs
+
+        # Runs before VllmConfig validates the runner choice, so an explicit
+        # request fails with the Metal constraint, not upstream's Triton check.
+        if vllm_envs.VLLM_USE_V2_MODEL_RUNNER:
+            raise NotImplementedError(
+                "VLLM_USE_V2_MODEL_RUNNER=1 is not supported on Metal: "
+                "MetalWorker implements the V1 model runner contract. Unset it "
+                "(vllm-metal defaults it to 0)."
+            )
+
         config = get_config()
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
@@ -956,13 +967,7 @@ class MetalPlatform(Platform):
         a hybrid model, explaining the cache-block-size translation mechanism
         (PR #235).
         """
-        from vllm_metal.compat import ensure_vllm_auto_fit_null_block_patch
         from vllm_metal.config import get_config
-
-        # Runs in the engine process after vLLM is fully imported, right before
-        # KV sizing: the reliable spot to (re-)install the auto-fit null-block
-        # patch that plugin activation may have skipped mid-import.
-        ensure_vllm_auto_fit_null_block_patch()
 
         metal_config = get_config()
         model_config = vllm_config.model_config
