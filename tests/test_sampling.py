@@ -535,6 +535,48 @@ class TestV1SamplingBatch:
         # Top-k row stays inside the top-64 candidates (values 960..1023).
         assert VOCAB_SIZE - top_k <= result.token_ids[1] < VOCAB_SIZE
 
+    def test_min_p_narrows_candidates_before_top_p(self) -> None:
+        """Native sampling applies min_p before top_p."""
+        probs = [0.5, 0.4, 0.1]
+        logits = mx.array([[float(np.log(p)) for p in probs]], dtype=mx.float32)
+        params = [SamplingParams(temperature=1.0, top_p=0.55, min_p=0.25)]
+        assert SamplingBatch.params_allow_native_random(params)
+
+        keys = iter([mx.random.key(seed) for seed in range(64)])
+        sampled = {
+            int(
+                SamplingBatch.native_decode_tokens(
+                    logits,
+                    params,
+                    vocab_size=len(probs),
+                    next_key=lambda: next(keys),
+                ).item()
+            )
+            for _ in range(64)
+        }
+        assert sampled == {0}
+
+    def test_min_p_masks_after_temperature_on_torch_path(self) -> None:
+        """Torch sampling applies min_p after temperature."""
+        sampler = Sampler()
+        sampled = set()
+        for seed in range(40):
+            logits = mx.array([[4.0, 2.0, 0.0, -2.0]], dtype=mx.float32)
+            sp = SamplingParams(temperature=2.0, min_p=0.3, seed=seed)
+            assert not SamplingBatch.params_allow_native_random([sp])
+            batch = SamplingBatch(
+                [sp],
+                [[1]],
+                [[]],
+                vocab_size=4,
+                generators={0: torch.Generator().manual_seed(seed)},
+            )
+            metadata = batch.make_sampling_metadata(torch.zeros(1, 4))
+            assert len(list(metadata.logitsprocs.argmax_invariant)) == 1
+
+            sampled.add(sample_from_logits(logits, batch, sampler).token_ids[0])
+        assert sampled == {0, 1}
+
     def test_bad_words_blocks_greedy_token(self) -> None:
         """Greedy + bad_words_token_ids must fall back and block the banned token."""
         logits = mx.array([[10.0, 1.0, 5.0, 1.0]], dtype=mx.float32)
